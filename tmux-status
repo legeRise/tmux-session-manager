@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+printf "\n=== TMUX STATUS ===\n\n"
+printf "\n%-8s %-5s %-6s %-25s %s\n" "Window" "Pane" "State" "Project" "Running"
+printf "%-8s %-5s %-6s %-25s %s\n" "------" "----" "-----" "-------" "-------"
+
+tmux list-panes -a -F '#{session_name}|#{window_name}|#{window_index}|#{pane_index}|#{pane_current_path}|#{pane_pid}' |
+while IFS='|' read -r session window_name window_index pane_index path pane_pid; do
+    project=$(basename "$path")
+
+    child_pid=$(pgrep -P "$pane_pid" -n || true)
+
+    if [[ -z "$child_pid" ]]; then
+        state="🟡"
+        cmd="Idle"
+    else
+        state="🟢"
+        cmd=$(ps -p "$child_pid" -o args=)
+    fi
+
+    printf "%-8s %-5s %-6s %-25s %s\n" \
+        "$window_index" \
+        "$pane_index" \
+        "$state" \
+        "$project" \
+        "$cmd"
+done

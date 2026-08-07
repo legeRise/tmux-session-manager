@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+current_session=$(tmux display-message -p '#S')
+
+read -r -p "Export name [$current_session]: " export_name
+export_name=${export_name:-$current_session}
+
+output_file="${export_name}.yaml"
+
+echo "Exporting session: $current_session"
+echo "Saving workspace: $output_file"
+echo
+
+cat > "$output_file" <<EOF
+workspace: $export_name
+source_session: $current_session
+windows:
+EOF
+
+current_window=""
+
+while IFS='|' read -r window_name window_index pane_index path pane_pid; do
+
+    project=$(basename "$path")
+
+    child_pid=$(pgrep -P "$pane_pid" -n || true)
+
+    if [[ -z "$child_pid" ]]; then
+        cmd=""
+    else
+        cmd=$(ps -p "$child_pid" -o args=)
+    fi
+
+    if [[ "$window_index" != "$current_window" ]]; then
+        cat >> "$output_file" <<EOF
+
+  - name: "$window_name"
+    index: $window_index
+    panes:
+EOF
+        current_window="$window_index"
+    fi
+
+    cat >> "$output_file" <<EOF
+      - index: $pane_index
+        project: "$project"
+        cwd: "$path"
+        command: "$cmd"
+EOF
+
+done < <(
+    tmux list-panes -s -t "$current_session" \
+    -F '#{window_name}|#{window_index}|#{pane_index}|#{pane_current_path}|#{pane_pid}'
+)
+
+echo
+echo "Done: $output_file"

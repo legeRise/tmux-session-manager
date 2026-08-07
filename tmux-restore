@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ $# -eq 0 ]; then
+    echo "Usage: tmux-restore workspace.yaml"
+    exit 1
+fi
+
+yaml_file="$1"
+
+if [ ! -f "$yaml_file" ]; then
+    echo "File not found: $yaml_file"
+    exit 1
+fi
+
+session=$(python3 - "$yaml_file" <<'EOF'
+import yaml
+import sys
+
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f)
+
+print(data["workspace"])
+EOF
+)
+
+echo "Restoring session: $session"
+
+if tmux has-session -t "$session" 2>/dev/null; then
+    echo "Session already exists: $session"
+    exit 1
+fi
+
+
+python3 - "$yaml_file" <<'PY'
+import yaml
+import subprocess
+import sys
+import time
+
+file = sys.argv[1]
+
+with open(file) as f:
+    data = yaml.safe_load(f)
+
+session = data["workspace"]
+
+first = True
+
+for win in data["windows"]:
+    name = win["name"]
+
+    for pane_number, pane in enumerate(win["panes"]):
+
+        cwd = pane["cwd"]
+        command = pane.get("command", "")
+
+        if command == "Idle":
+            command = ""
+
+        if first:
+            subprocess.run([
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-n",
+                name,
+                "-c",
+                cwd
+            ])
+
+            first = False
+
+        elif pane_number == 0:
+            subprocess.run([
+                "tmux",
+                "new-window",
+                "-t",
+                session,
+                "-n",
+                name,
+                "-c",
+                cwd
+            ])
+
+        else:
+            subprocess.run([
+                "tmux",
+                "split-window",
+                "-t",
+                session,
+                "-c",
+                cwd
+            ])
+
+        time.sleep(0.2)
+
+        # get the newest pane created
+        pane_id = subprocess.check_output(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                "#{pane_id}"
+            ]
+        ).decode().strip().split("\n")[-1]
+
+        subprocess.run([
+            "tmux",
+            "send-keys",
+            "-t",
+            pane_id,
+            f"cd '{cwd}'",
+            "C-m"
+        ])
+
+        if command.strip():
+            subprocess.run([
+                "tmux",
+                "send-keys",
+                "-t",
+                pane_id,
+                command,
+                "C-m"
+            ])
+
+        time.sleep(0.3)
+
+print("Restore complete:", session)
+
+PY
