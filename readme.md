@@ -1,116 +1,99 @@
 # tmux-session-manager
 
-Simple tmux tools to save, restore, and manage terminal sessions.
+Save a tmux workspace as YAML and restore it later.
 
-This project helps you capture your current tmux workspace and recreate it later.
-
-## Features
-
-### tmux-status
-
-View your current tmux workspace:
-
-- windows
-- panes
-- running commands
-- project directories
-- pane status
-
-Example:
+The CLI is `tmux-manager`. It lists sessions, exports a session to a file, and recreates windows, panes, directories, and a best-effort command.
 
 ```bash
-tmux-status
+tmux-manager --help
+tmux-manager export --help
+tmux-manager restore --help
 ```
+
+## Everyday use
+
+```bash
+tmux-manager ls                 # live tmux sessions
+tmux-manager export             # save current session
+tmux-manager restore            # pick from saved workspaces
+tmux-manager restore my-project # preview, then confirm
+```
+
+Exports land in `~/.local/share/tmux-manager/workspaces/` (or `$XDG_DATA_HOME/tmux-manager/workspaces`). You do not have to remember a file path.
+
+`tmux-manager restore` with no name lists what is saved: name, window count, pane count, and window names. Choosing one (or passing a name) prints a preview of directories and commands, then asks before creating the session.
+
+If that session is already running, restore **does not replace it**. The live session is left untouched. You can attach to it, or restore a copy under another name:
+
+```bash
+tmux attach -t my-project
+tmux-manager restore my-project --as my-project-copy
+```
+
+```bash
+tmux-manager export -t other-session
+tmux-manager restore my-project -y
+tmux-manager restore my-project --no-commands
+tmux-manager export -o ./work.yaml     # custom path if you need it
+```
+
+Set `TMUX_MANAGER_HOME` to store files somewhere else.
+
+Older names still work: `tmux-status`, `tmux-export`, `tmux-restore`.
 
 ---
 
-### tmux-export
+## How to run things (important)
 
-Export your current tmux session into a YAML workspace file.
+This tool does **not** try to capture every environment variable, virtualenv, port flag, or shell quirk. That path is fragile, and a missed env var looks like a successful restore until something breaks.
 
-Example:
+Put the real process behind a small script in the project, then leave that script running in the pane:
 
 ```bash
-tmux-export
+./run.sh
+./local.sh
+./production.sh
+./deploy.sh
 ```
 
-This creates a file like:
+Example `run.sh`:
 
-```text
-my-project.yaml
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+export PORT=8000
+export APP_ENV=local
+source .venv/bin/activate
+exec python manage.py runserver "$PORT"
 ```
 
-The export contains:
+Export will see `./run.sh` (or `bash run.sh`). Restore sends that same command. Ports, secrets, venvs, and flags stay in your script, not in tmux YAML.
 
-- session name
-- windows
-- panes
-- working directories
-- running commands
+If a pane is only a shell, export stores an empty command and restore leaves it idle.
 
 ---
 
-### tmux-restore
-
-Restore a workspace from an exported YAML file.
-
-Example:
-
-```bash
-tmux-restore my-project.yaml
-```
-
-It will recreate:
-
-- tmux session
-- windows
-- panes
-- directories
-- commands
-
----
-
-# Installation
-
-Clone the repository:
+## Installation
 
 ```bash
 git clone https://github.com/legeRise/tmux-session-manager.git
 cd tmux-session-manager
+chmod +x tmux-manager tmux-*
 ```
 
-Make scripts executable:
+Optional:
 
 ```bash
-chmod +x tmux-*
+cp tmux-manager tmux-status tmux-export tmux-restore ~/.local/bin/
 ```
 
-Optional: install globally:
-
-```bash
-cp tmux-* ~/.local/bin/
-```
-
-Now you can run:
-
-```bash
-tmux-status
-tmux-export
-tmux-restore
-```
-
-from anywhere.
-
----
-
-# Requirements
+## Requirements
 
 - Linux/macOS
 - tmux
 - Python 3
 - PyYAML
-
-Install PyYAML:
 
 ```bash
 pip install pyyaml
@@ -118,71 +101,53 @@ pip install pyyaml
 
 ---
 
-# Version
+## YAML example
 
-## v1.0
-
-This is the first version of tmux-session-manager.
-
-The goal of v1 is simple:
-
-> Save a tmux workspace and restore it later.
-
----
-
-# Known Limitations
-
-`tmux-export` works well for normal commands, but v1 has some limitations.
-
-## Environment variables are not captured
-
-Commands that depend on temporary environment variables will not restore correctly.
-
-Example:
-
-Works:
-
-```bash
-python manage.py runserver
+```yaml
+workspace: my-project
+source_session: my-project
+windows:
+  - name: code
+    index: 0
+    layout: 1a2b,160x40,0,0{80x40,0,0,1,80x40,81,0,2}
+    panes:
+      - index: 0
+        cwd: /home/you/my-project
+        command: vim
+      - index: 1
+        cwd: /home/you/my-project
+        command: ./run.sh
 ```
 
-May not work:
-
-```bash
-PORT=8000 python main.py
-```
-
-because the `PORT=8000` environment variable is not saved.
+YAML is written and read with PyYAML, so commands and paths are escaped instead of pasted as raw text.
 
 ---
 
-## Command arguments may have limitations
+## Version
 
-Commands like:
+### v1.1
 
-```bash
-python main.py --host 0.0.0.0 --port 8000
-```
+- Single CLI: `tmux-manager ls|export|restore`
+- Safe YAML dump/load
+- Restore targets panes by id (`-P -F`) and reapplies window layout
+- `ls` groups session, window name, and pane
+- Documented `run.sh` workflow instead of capturing env/args
+- Default workspace directory, restore catalog, and restore preview
 
-may need manual adjustment after restore depending on the application.
+### v1.0
 
----
-
-## Future improvements
-
-Planned improvements:
-
-- capture environment variables
-- better shell handling
-- support virtual environments automatically
-- improve command restoration
-- add safer YAML handling
-- better cross-platform support
+Save a tmux workspace and restore it later.
 
 ---
 
-# Why?
+## Later
 
-tmux is already a powerful workspace manager, but after losing a server session or moving machines, rebuilding everything manually is annoying.
+Possible next step: a periodic snapshot (`cron` / systemd timer) that runs `tmux-manager export -t SESSION` so the file in the workspaces folder stays fresh.
 
-This project tries to make tmux workspaces portable.
+Not in this version: env capture, auto-venv, argument reconstruction.
+
+---
+
+## Why?
+
+tmux is a good workspace. Rebuilding it after a reboot or a new machine is not. This keeps the workspace as a portable file, and keeps runtime details in project scripts you already understand.
