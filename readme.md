@@ -76,36 +76,37 @@ If a pane is only a shell, export stores an empty command and restore leaves it 
 
 ## Installation
 
-Clone the repository wherever you want to keep it, make the scripts executable, and add that directory to your `PATH`:
+The recommended installation keeps the **Git repository itself in `~/.local/bin`**. This avoids putting a project directory such as `~/tmux-session-manager` in your home directory, while keeping updates simple.
+
+`~/.local/bin` is a standard user-local executable directory and is commonly already in `PATH`. The installation creates symlinks for the commands, so there are no duplicate copies to keep in sync.
 
 ```bash
-git clone https://github.com/legeRise/tmux-session-manager.git
-cd tmux-session-manager
+git clone https://github.com/legeRise/tmux-session-manager.git ~/.local/bin/tmux-session-manager
+cd ~/.local/bin/tmux-session-manager
 chmod +x tmux-manager tmux-*
-echo 'export PATH="$HOME/tmux-session-manager:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+
+ln -s ~/.local/bin/tmux-session-manager/tmux-manager ~/.local/bin/tmux-manager
+ln -s ~/.local/bin/tmux-session-manager/tmux-status ~/.local/bin/tmux-status
+ln -s ~/.local/bin/tmux-session-manager/tmux-export ~/.local/bin/tmux-export
+ln -s ~/.local/bin/tmux-session-manager/tmux-restore ~/.local/bin/tmux-restore
 ```
 
-Now the commands are available from any directory:
+After installation, use the CLI from anywhere:
 
 ```bash
 tmux-manager ls
-tmux-manager export
-tmux-manager restore
 ```
 
-### Updating
-
-Because the repository itself is on your machine, updating is simple:
+To update the tool later, update the repository directly:
 
 ```bash
-cd ~/tmux-session-manager
+cd ~/.local/bin/tmux-session-manager
 git pull
 ```
 
-There is no separate copy to reinstall after an update. The commands you run from `PATH` point directly to the repository files.
+The symlinks continue pointing to the repository files, so the updated version is used immediately. You can also inspect or modify the source normally because it remains a regular Git repository.
 
-If you clone the repository somewhere else, use that path instead when adding it to `PATH` and when running `git pull`.
+If `~/.local/bin` is not in your `PATH`, add it using your shell's normal configuration. Most Linux desktop environments already include it for user-local executables.
 
 ## Requirements
 
@@ -152,7 +153,6 @@ YAML is written and read with PyYAML, so commands and paths are escaped instead 
 - `ls` groups session, window name, and pane
 - Documented `run.sh` workflow instead of capturing env/args
 - Default workspace directory, restore catalog, and restore preview
-- Installation keeps the Git repository intact so updates are just `git pull`
 
 ### v1.0
 
