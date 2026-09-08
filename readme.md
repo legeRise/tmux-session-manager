@@ -76,17 +76,36 @@ If a pane is only a shell, export stores an empty command and restore leaves it 
 
 ## Installation
 
+Clone the repository wherever you want to keep it, make the scripts executable, and add that directory to your `PATH`:
+
 ```bash
 git clone https://github.com/legeRise/tmux-session-manager.git
 cd tmux-session-manager
 chmod +x tmux-manager tmux-*
+echo 'export PATH="$HOME/tmux-session-manager:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-Optional:
+Now the commands are available from any directory:
 
 ```bash
-cp tmux-manager tmux-status tmux-export tmux-restore ~/.local/bin/
+tmux-manager ls
+tmux-manager export
+tmux-manager restore
 ```
+
+### Updating
+
+Because the repository itself is on your machine, updating is simple:
+
+```bash
+cd ~/tmux-session-manager
+git pull
+```
+
+There is no separate copy to reinstall after an update. The commands you run from `PATH` point directly to the repository files.
+
+If you clone the repository somewhere else, use that path instead when adding it to `PATH` and when running `git pull`.
 
 ## Requirements
 
@@ -133,6 +152,7 @@ YAML is written and read with PyYAML, so commands and paths are escaped instead 
 - `ls` groups session, window name, and pane
 - Documented `run.sh` workflow instead of capturing env/args
 - Default workspace directory, restore catalog, and restore preview
+- Installation keeps the Git repository intact so updates are just `git pull`
 
 ### v1.0
 
