@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""List, export, and restore tmux workspaces."""
+"""List, export, check, diff, and restore tmux workspaces."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import re
+import shlex
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -17,13 +23,21 @@ except ImportError:
     sys.exit("PyYAML is required. Install it with: pip install pyyaml")
 
 
+VERSION = "1.2"
+
 HELP_EPILOG = """
 examples:
   tmux-manager ls
   tmux-manager export
+  tmux-manager export --keep 10
   tmux-manager restore
   tmux-manager restore my-project
-  tmux-manager restore --help
+  tmux-manager restore my-project --if-missing --yes
+  tmux-manager restore my-project --missing-windows --yes
+  tmux-manager diff my-project
+  tmux-manager check my-project
+  tmux-manager install-hook
+  tmux-manager install-boot my-project
 
 workspaces are saved under:
   $XDG_DATA_HOME/tmux-manager/workspaces
@@ -32,20 +46,184 @@ workspaces are saved under:
 override with TMUX_MANAGER_HOME if you want a different folder.
 """
 
+SHELLS = {
+    "bash",
+    "zsh",
+    "sh",
+    "dash",
+    "ash",
+    "fish",
+    "ksh",
+    "ksh93",
+    "mksh",
+    "pdksh",
+    "tcsh",
+    "csh",
+    "nu",
+    "elvish",
+    "xonsh",
+    "pwsh",
+    "rbash",
+}
+
+HOOK_START = "# >>> tmux-manager hook >>>"
+HOOK_END = "# <<< tmux-manager hook <<<"
+BOOT_MARKER = "# tmux-manager boot: "
+DEFAULT_WAIT_TIMEOUT = 60.0
+DEFAULT_SHELL_TIMEOUT = 15.0
+
+PANE_FIELDS = [
+    "#{session_name}",
+    "#{window_name}",
+    "#{window_index}",
+    "#{window_id}",
+    "#{window_layout}",
+    "#{window_zoomed_flag}",
+    "#{window_active}",
+    "#{pane_index}",
+    "#{pane_id}",
+    "#{pane_current_path}",
+    "#{pane_pid}",
+    "#{pane_active}",
+    "#{pane_title}",
+    "#{pane_current_command}",
+    "#{pane_dead}",
+    "#{@tm_command}",
+]
+PANE_SEP = "\x1f"
+PANE_FORMAT = PANE_SEP.join(PANE_FIELDS)
+
+SNAPSHOT_STEM_RE = re.compile(
+    r"\.\d{4}-\d{2}-\d{2}T\d{4}(?:\d{2})?(?:-\d+)?$"
+)
+
+BASH_HOOK = r"""# Record the exact command typed in each tmux pane for `tmux-manager export`.
+if [ -n "${TMUX-}" ] && [ -z "${__tmux_manager_hook_installed-}" ] && [[ $- == *i* ]]; then
+    __tmux_manager_hook_installed=1
+    __tmux_manager_in_prompt=0
+
+    __tmux_manager_precmd() {
+        __tmux_manager_in_prompt=1
+        if [ -n "${TMUX_PANE-}" ]; then
+            command tmux set -p -u -t "$TMUX_PANE" @tm_command >/dev/null 2>&1
+        fi
+    }
+
+    __tmux_manager_preexec() {
+        if [ "${__tmux_manager_in_prompt-0}" != 1 ]; then
+            return 0
+        fi
+        case $- in
+            *i*) ;;
+            *) return 0 ;;
+        esac
+        [ -n "${TMUX-}" ] && [ -n "${TMUX_PANE-}" ] || return 0
+        case "$BASH_COMMAND" in
+            __tmux_manager_precmd*|__tmux_manager_preexec*) return 0 ;;
+            "command tmux set"*) return 0 ;;
+        esac
+        __tmux_manager_in_prompt=0
+        local line
+        line=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+        if [[ $line =~ ^[[:space:]]*[0-9]+[[:space:]]+(.*)$ ]]; then
+            line=${BASH_REMATCH[1]}
+        else
+            line=$BASH_COMMAND
+        fi
+        if [ -n "$line" ]; then
+            command tmux set -p -t "$TMUX_PANE" @tm_command "$line" >/dev/null 2>&1
+        fi
+    }
+
+    trap '__tmux_manager_preexec' DEBUG
+
+    # Keep this hook last: prompt commands must not be mistaken for user input.
+    case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
+        "declare -a"*) PROMPT_COMMAND+=(__tmux_manager_precmd) ;;
+        *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__tmux_manager_precmd" ;;
+    esac
+fi"""
+
+ZSH_HOOK = r"""# Record the exact command typed in each tmux pane for `tmux-manager export`.
+if [[ -n "${TMUX-}" && -z "${__tmux_manager_hook_installed-}" && -o interactive ]]; then
+    typeset -g __tmux_manager_hook_installed=1
+
+    __tmux_manager_preexec() {
+        [[ -n "${TMUX-}" && -n "${TMUX_PANE-}" ]] || return 0
+        command tmux set -p -t "$TMUX_PANE" @tm_command "$1" >/dev/null 2>&1
+    }
+
+    __tmux_manager_precmd() {
+        [[ -n "${TMUX-}" && -n "${TMUX_PANE-}" ]] || return 0
+        command tmux set -p -u -t "$TMUX_PANE" @tm_command >/dev/null 2>&1
+    }
+
+    autoload -Uz add-zsh-hook
+    add-zsh-hook preexec __tmux_manager_preexec
+    add-zsh-hook precmd __tmux_manager_precmd
+fi"""
+
+
+class TmuxError(RuntimeError):
+    """A tmux command failed."""
+
+
+class RunLog:
+    """Print progress and optionally append it to a log file."""
+
+    def __init__(self, path: str | None = None):
+        self.handle = None
+        if path:
+            log_path = Path(path).expanduser()
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                self.handle = log_path.open("a", encoding="utf-8")
+            except OSError as exc:
+                die(f"Cannot open log file {log_path}: {exc}")
+
+    def _write(self, level: str, message: str) -> None:
+        if self.handle is None:
+            return
+        stamp = datetime.now().isoformat(timespec="seconds")
+        self.handle.write(f"{stamp} {level} {message}\n")
+        self.handle.flush()
+
+    def info(self, message: str) -> None:
+        print(message)
+        self._write("INFO", message)
+
+    def warn(self, message: str) -> None:
+        print(f"warning: {message}", file=sys.stderr)
+        self._write("WARN", message)
+
+    def error(self, message: str) -> None:
+        print(f"error: {message}", file=sys.stderr)
+        self._write("ERROR", message)
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
 
 def tmux(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["tmux", *args],
-        check=check,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            ["tmux", *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise TmuxError("tmux is not installed or not in PATH") from None
+    if check and result.returncode != 0:
+        message = result.stderr.strip() or f"tmux {' '.join(args)} failed"
+        raise TmuxError(message)
+    return result
 
 
 def tmux_out(args: list[str]) -> str:
-    result = tmux(args)
-    return result.stdout.rstrip("\n")
+    return tmux(args).stdout.rstrip("\n")
 
 
 def die(message: str, code: int = 1) -> None:
@@ -74,28 +252,71 @@ def safe_filename(name: str) -> str:
     return cleaned.strip("-._") or "workspace"
 
 
-def pane_command(pane_pid: str) -> str:
-    child = subprocess.run(
-        ["pgrep", "-P", pane_pid, "-n"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    child_pid = child.stdout.strip()
-    if child.returncode != 0 or not child_pid:
+def as_int(value: object, fallback: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+
+
+def run_capture(args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            args,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
         return ""
-    args = subprocess.run(
-        ["ps", "-p", child_pid, "-o", "args="],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    return args.stdout.strip() if args.returncode == 0 else ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
-def collect_panes(session: str | None = None) -> list[dict]:
-    fmt = "#{session_name}\t#{window_name}\t#{window_index}\t#{window_id}\t#{window_layout}\t#{pane_index}\t#{pane_id}\t#{pane_current_path}\t#{pane_pid}"
-    args = ["list-panes", "-F", fmt]
+def process_args(pid: str) -> str:
+    return run_capture(["ps", "-p", str(pid), "-o", "args="])
+
+
+def process_comm(pid: str) -> str:
+    return run_capture(["ps", "-p", str(pid), "-o", "comm="])
+
+
+def oldest_child(pid: str) -> str:
+    return run_capture(["pgrep", "-P", str(pid), "-o"])
+
+
+def shell_name(command: str) -> str:
+    return os.path.basename(command.strip()).lstrip("-")
+
+
+def is_shell(name: str) -> bool:
+    return shell_name(name) in SHELLS
+
+
+def guess_pane_command(pane_pid: str, current_command: str) -> str:
+    """Best-effort guess used only when the shell hook recorded nothing.
+
+    For a shell pane, the oldest child is used instead of the newest: a
+    background job started later must not replace the program that was
+    launched in the foreground. A pane started directly with a program is
+    reported from its own process arguments.
+    """
+    comm = process_comm(pane_pid)
+    if comm and not is_shell(comm):
+        return process_args(pane_pid)
+    child = oldest_child(pane_pid)
+    if child:
+        return process_args(child)
+    if current_command and not is_shell(current_command):
+        return process_args(pane_pid)
+    return ""
+
+
+def collect_panes(
+    session: str | None = None, no_commands: bool = False
+) -> list[dict]:
+    args = ["list-panes", "-F", PANE_FORMAT]
     if session:
         args[1:1] = ["-s", "-t", session]
     else:
@@ -103,14 +324,14 @@ def collect_panes(session: str | None = None) -> list[dict]:
 
     result = tmux(args, check=False)
     if result.returncode != 0:
-        die(result.stderr.strip() or "tmux is not running")
+        raise TmuxError(result.stderr.strip() or "tmux is not running")
 
     panes = []
     for line in result.stdout.splitlines():
         if not line:
             continue
-        parts = line.split("\t")
-        if len(parts) != 9:
+        parts = line.split(PANE_SEP)
+        if len(parts) != len(PANE_FIELDS):
             continue
         (
             session_name,
@@ -118,11 +339,27 @@ def collect_panes(session: str | None = None) -> list[dict]:
             window_index,
             window_id,
             window_layout,
+            window_zoomed,
+            window_active,
             pane_index,
             pane_id,
             cwd,
             pane_pid,
+            pane_active,
+            pane_title,
+            current_command,
+            pane_dead,
+            tm_command,
         ) = parts
+
+        command = ""
+        guessed = False
+        if not no_commands:
+            command = tm_command
+            if not command:
+                command = guess_pane_command(pane_pid, current_command)
+                guessed = bool(command)
+
         panes.append(
             {
                 "session": session_name,
@@ -130,11 +367,19 @@ def collect_panes(session: str | None = None) -> list[dict]:
                 "window_index": int(window_index),
                 "window_id": window_id,
                 "layout": window_layout,
+                "window_zoomed": window_zoomed == "1",
+                "window_active": window_active == "1",
                 "pane_index": int(pane_index),
                 "pane_id": pane_id,
                 "cwd": cwd,
                 "project": os.path.basename(cwd) if cwd else "",
-                "command": pane_command(pane_pid),
+                "pane_pid": pane_pid,
+                "pane_active": pane_active == "1",
+                "pane_title": pane_title,
+                "current_command": current_command,
+                "dead": pane_dead == "1",
+                "command": command,
+                "guessed": guessed,
             }
         )
     return panes
@@ -148,7 +393,10 @@ def read_workspace(path: Path) -> dict | None:
         return None
     if not isinstance(data, dict) or "workspace" not in data:
         return None
-    data["windows"] = data.get("windows") or []
+    windows = data.get("windows") or []
+    if not isinstance(windows, list):
+        return None
+    data["windows"] = [window for window in windows if isinstance(window, dict)]
     return data
 
 
@@ -171,7 +419,9 @@ def print_preview(path: Path, data: dict) -> None:
     print()
     print(f"File:      {path}")
     print(f"Session:   {data.get('workspace')}")
-    if data.get("source_session") and data.get("source_session") != data.get("workspace"):
+    if data.get("source_session") and data.get("source_session") != data.get(
+        "workspace"
+    ):
         print(f"Exported:  {data.get('source_session')}")
     print(f"Windows:   {windows}")
     print(f"Panes:     {panes}")
@@ -179,16 +429,33 @@ def print_preview(path: Path, data: dict) -> None:
     for window in data.get("windows") or []:
         wname = window.get("name") or "window"
         windex = window.get("index", "?")
-        print(f"  {windex}:{wname}")
+        marks = []
+        if window.get("zoomed"):
+            marks.append("zoomed")
+        if data.get("active_window") == windex:
+            marks.append("active")
+        suffix = f"  [{', '.join(marks)}]" if marks else ""
+        print(f"  {windex}:{wname}{suffix}")
         for pane in window.get("panes") or []:
             command = pane.get("command") or "-"
             cwd = pane.get("cwd") or "?"
-            print(f"    pane {pane.get('index', '?')}  {cwd}  {command}")
+            mark = "  (guessed)" if pane.get("guessed") else ""
+            print(
+                f"    pane {pane.get('index', '?')}  {cwd}  {command}{mark}"
+            )
     print()
 
 
+def is_snapshot_copy(path: Path) -> bool:
+    return bool(SNAPSHOT_STEM_RE.search(path.stem))
+
+
 def saved_workspace_files() -> list[Path]:
-    return sorted(workspaces_dir().glob("*.yaml"))
+    return [
+        path
+        for path in sorted(workspaces_dir().glob("*.yaml"))
+        if not is_snapshot_copy(path)
+    ]
 
 
 def print_catalog() -> list[tuple[Path, dict]]:
@@ -227,21 +494,46 @@ def print_catalog() -> list[tuple[Path, dict]]:
     return loaded
 
 
-def resolve_workspace_path(target: str) -> Path:
-    raw = Path(target).expanduser()
-    if raw.is_file():
-        return raw
+def looks_like_path(target: str) -> bool:
+    if target.startswith((".", "/", "~")):
+        return True
+    if "/" in target or os.sep in target:
+        return True
+    return Path(target).suffix.lower() in {".yaml", ".yml"}
 
+
+def resolve_workspace_path(target: str) -> Path:
     store = workspaces_dir()
+    if looks_like_path(target):
+        path = Path(target).expanduser()
+        bare_name = (
+            not path.is_absolute()
+            and "/" not in target
+            and os.sep not in target
+        )
+        if bare_name:
+            stored = store / target
+            if stored.is_file():
+                return stored
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if path.is_file():
+            return path
+        die(f"Workspace file not found: {path}")
+
     candidates = [
         store / target,
         store / f"{target}.yaml",
-        Path(f"{target}.yaml"),
-        raw,
+        store / f"{target}.yml",
     ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
+
+    for path in saved_workspace_files():
+        data = read_workspace(path)
+        if data is not None and str(data.get("workspace")) == target:
+            return path
 
     die(
         f"Workspace not found: {target}\n"
@@ -275,6 +567,8 @@ def cmd_ls(_args: argparse.Namespace) -> None:
     for pane in panes:
         state = "run" if pane["command"] else "idle"
         command = pane["command"] or "-"
+        if pane["guessed"]:
+            command = f"{command} (guessed)"
         window = f"{pane['window_index']}:{pane['window_name']}"
         print(
             f"{pane['session']:<16} {window:<22} {pane['pane_index']:<6} {state:<8} {pane['project']:<20} {command}"
@@ -293,12 +587,15 @@ def resolve_session(requested: str | None) -> str:
     return tmux_out(["display-message", "-p", "#S"])
 
 
-def build_workspace(session: str, workspace_name: str) -> dict:
-    panes = collect_panes(session)
+def build_workspace(
+    session: str, workspace_name: str, no_commands: bool = False
+) -> dict:
+    panes = collect_panes(session, no_commands=no_commands)
     if not panes:
         die(f"No panes found in session: {session}")
 
     windows: OrderedDict[int, dict] = OrderedDict()
+    active_window: int | None = None
     for pane in panes:
         idx = pane["window_index"]
         if idx not in windows:
@@ -308,67 +605,701 @@ def build_workspace(session: str, workspace_name: str) -> dict:
                 "layout": pane["layout"],
                 "panes": [],
             }
-        windows[idx]["panes"].append(
-            {
-                "index": pane["pane_index"],
-                "cwd": pane["cwd"],
-                "command": pane["command"],
-            }
-        )
+            if pane["window_zoomed"]:
+                windows[idx]["zoomed"] = True
+        if pane["window_active"]:
+            active_window = idx
 
-    return {
+        pane_entry: dict = {
+            "index": pane["pane_index"],
+            "cwd": pane["cwd"],
+            "command": pane["command"],
+        }
+        if pane["pane_title"]:
+            pane_entry["title"] = pane["pane_title"]
+        if pane["guessed"]:
+            pane_entry["guessed"] = True
+        if pane["pane_active"]:
+            windows[idx]["active_pane"] = pane["pane_index"]
+        windows[idx]["panes"].append(pane_entry)
+
+    for window in windows.values():
+        window["panes"].sort(key=lambda pane: as_int(pane.get("index"), 0))
+
+    data: dict = {
         "workspace": workspace_name,
         "source_session": session,
         "windows": list(windows.values()),
     }
+    if active_window is not None:
+        data["active_window"] = active_window
+    return data
 
 
-def cmd_export(args: argparse.Namespace) -> None:
+def snapshot_problems(old: dict, new: dict) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    details: list[str] = []
+    old_windows, old_panes, _ = workspace_stats(old)
+    new_windows, new_panes, _ = workspace_stats(new)
+
+    if new_windows < old_windows:
+        reasons.append("fewer windows")
+        details.append(f"windows: {old_windows} -> {new_windows}")
+    if new_panes < old_panes:
+        reasons.append("fewer panes")
+        details.append(f"panes: {old_panes} -> {new_panes}")
+
+    def command_map(data: dict) -> dict[tuple[int, int], str]:
+        result = {}
+        for window in data.get("windows") or []:
+            widx = as_int(window.get("index"), 0)
+            for pane in window.get("panes") or []:
+                pidx = as_int(pane.get("index"), 0)
+                result[(widx, pidx)] = str(pane.get("command") or "")
+        return result
+
+    old_commands = command_map(old)
+    new_commands = command_map(new)
+    turned_idle = [
+        key
+        for key, command in old_commands.items()
+        if command.strip()
+        and key in new_commands
+        and not new_commands[key].strip()
+    ]
+    if turned_idle:
+        reasons.append("running panes would become idle")
+        details.append(
+            "idle panes: "
+            + ", ".join(f"{widx}:{pidx}" for widx, pidx in turned_idle)
+        )
+    return reasons, details
+
+
+def write_workspace(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle_fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(
+                data,
+                handle,
+                sort_keys=False,
+                default_flow_style=False,
+                allow_unicode=True,
+            )
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def write_dated_copy(output: Path, keep: int) -> Path:
+    stamp = datetime.now().strftime("%Y-%m-%dT%H%M")
+    copy = output.with_name(f"{output.stem}.{stamp}{output.suffix}")
+    counter = 2
+    while copy.exists():
+        copy = output.with_name(
+            f"{output.stem}.{stamp}-{counter}{output.suffix}"
+        )
+        counter += 1
+    shutil.copy2(output, copy)
+
+    copies = [
+        path
+        for path in output.parent.iterdir()
+        if path.is_file()
+        and path.suffix == output.suffix
+        and path != output
+        and is_snapshot_copy(path)
+        and path.stem.startswith(f"{output.stem}.")
+    ]
+    copies.sort(key=lambda path: (path.stat().st_mtime, path.name))
+    for old in copies[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return copy
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    if args.keep is not None and args.keep < 1:
+        die("--keep must be at least 1")
     session = resolve_session(args.session)
     workspace_name = args.name or session
-    data = build_workspace(session, workspace_name)
+    data = build_workspace(
+        session, workspace_name, no_commands=args.no_commands
+    )
 
     if args.output:
         output = Path(args.output).expanduser()
     else:
         output = workspaces_dir() / f"{safe_filename(workspace_name)}.yaml"
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(
-            data,
-            handle,
-            sort_keys=False,
-            default_flow_style=False,
-            allow_unicode=True,
-        )
+    if output.exists() and not args.force:
+        old = read_workspace(output)
+        if old is not None:
+            reasons, details = snapshot_problems(old, data)
+            if reasons:
+                print(
+                    "warning: the new snapshot would be smaller or less active "
+                    f"than {output}:",
+                    file=sys.stderr,
+                )
+                for reason, detail in zip(reasons, details):
+                    print(f"  - {reason} ({detail})", file=sys.stderr)
+                if args.yes or not sys.stdin.isatty():
+                    die(
+                        "Refusing to overwrite a better snapshot. "
+                        "Use --force to save it anyway.",
+                        1,
+                    )
+                if not confirm("Overwrite anyway?"):
+                    print("Cancelled. The saved snapshot was not changed.")
+                    return 0
+
+    write_workspace(output, data)
+
+    kept = ""
+    if args.keep:
+        copy = write_dated_copy(output, args.keep)
+        kept = f"\nDated copy: {copy} (keeping {args.keep})"
 
     windows, panes, names = workspace_stats(data)
-    print(f"Saved '{session}' as {output}")
+    print(f"Saved '{session}' as {output}{kept}")
     print(f"{windows} windows, {panes} panes ({', '.join(names)})")
-    print(f"Restore later with: tmux-manager restore {output.stem}")
-
-
-def existing_cwd(cwd: str) -> str:
-    if cwd and os.path.isdir(cwd):
-        return cwd
-    home = os.path.expanduser("~")
-    print(f"warning: missing directory '{cwd}', using {home}", file=sys.stderr)
-    return home
-
-
-def pane_window_id(pane_id: str) -> str:
-    return tmux_out(["display-message", "-p", "-t", pane_id, "#{window_id}"])
-
-
-def send_command(pane_id: str, command: str) -> None:
-    if not command.strip():
-        return
-    tmux(["send-keys", "-t", pane_id, command, "C-m"])
+    print(f"Restore later with: tmux-manager restore {shlex.quote(workspace_name)}")
+    return 0
 
 
 def session_exists(name: str) -> bool:
-    return tmux(["has-session", "-t", name], check=False).returncode == 0
+    try:
+        return tmux(["has-session", "-t", name], check=False).returncode == 0
+    except TmuxError:
+        return False
+
+
+def display_pane(pane_id: str, fmt: str) -> str:
+    return tmux_out(["display-message", "-p", "-t", pane_id, fmt])
+
+
+def has_children(pid: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def wait_for_shell_ready(
+    pane_id: str, log: RunLog, timeout: float = DEFAULT_SHELL_TIMEOUT
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            info = display_pane(
+                pane_id, f"#{{pane_pid}}{PANE_SEP}#{{pane_current_command}}{PANE_SEP}#{{pane_dead}}"
+            )
+        except TmuxError:
+            return False
+        parts = info.split(PANE_SEP)
+        if len(parts) == 3:
+            pid, current, dead = parts
+            if dead != "1" and is_shell(current) and not has_children(pid):
+                return True
+        if time.monotonic() >= deadline:
+            log.warn(
+                f"{pane_id}: pane shell was not ready after {timeout:g}s; "
+                "sending the command anyway"
+            )
+            return False
+        time.sleep(0.05)
+
+
+def wait_for_target(target: str, timeout: float) -> bool:
+    target = target.strip()
+    if not target:
+        return True
+
+    if target.startswith(("/", ".", "~")):
+        path = Path(target).expanduser()
+        deadline = time.monotonic() + timeout
+        while True:
+            if path.exists():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    match = re.match(r"^\[([^\]]+)\]:(\d+)$", target)
+    if not match:
+        match = re.match(r"^([^:]+):(\d+)$", target)
+    if match:
+        host, port_text = match.group(1), match.group(2)
+        port = int(port_text)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = max(0.1, min(1.0, deadline - time.monotonic()))
+            try:
+                with socket.create_connection((host, port), timeout=remaining):
+                    return True
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    path = Path(target).expanduser()
+    deadline = time.monotonic() + timeout
+    while True:
+        if path.exists():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def wait_for_pane_targets(
+    pane: dict, window: dict, log: RunLog
+) -> None:
+    delay = pane.get("delay")
+    if delay is not None:
+        try:
+            delay_value = max(0.0, float(delay))
+        except (TypeError, ValueError):
+            log.warn(
+                f"window '{window.get('name')}' pane {pane.get('index')}: "
+                f"invalid delay {delay!r}, ignoring it"
+            )
+        else:
+            if delay_value:
+                time.sleep(delay_value)
+
+    targets = pane.get("wait_for")
+    if not targets:
+        return
+    if isinstance(targets, str):
+        targets = [targets]
+    elif not isinstance(targets, list):
+        targets = [str(targets)]
+
+    try:
+        timeout = float(pane.get("wait_timeout", DEFAULT_WAIT_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_WAIT_TIMEOUT
+
+    for target in targets:
+        text = str(target)
+        if not wait_for_target(text, timeout):
+            log.warn(
+                f"window '{window.get('name')}' pane {pane.get('index')}: "
+                f"timed out after {timeout:g}s waiting for {text}; "
+                "starting the command anyway"
+            )
+
+
+def send_command(pane_id: str, command: str) -> None:
+    tmux(["send-keys", "-t", pane_id, "-l", command])
+    tmux(["send-keys", "-t", pane_id, "Enter"])
+
+
+def pane_cwd(
+    pane: dict, window: dict, log: RunLog, window_index: int
+) -> tuple[str, bool]:
+    cwd = str(pane.get("cwd") or "")
+    home = str(Path.home())
+    if cwd and os.path.isdir(cwd):
+        return cwd, True
+    if not cwd:
+        return home, True
+    log.warn(
+        f"window '{window.get('name') or 'window'}' (index {window_index}), "
+        f"pane {pane.get('index')}: folder '{cwd}' does not exist; "
+        f"creating the pane in {home} and not sending its command"
+    )
+    return home, False
+
+
+def create_first_window(
+    session: str, window: dict, cwd: str
+) -> tuple[str, str]:
+    args = ["new-session", "-d", "-s", session]
+    name = str(window.get("name") or "")
+    if name:
+        args += ["-n", name]
+    args += [
+        "-c",
+        cwd,
+        "-P",
+        "-F",
+        f"#{{pane_id}}{PANE_SEP}#{{window_id}}",
+    ]
+    output = tmux_out(args)
+    parts = output.split(PANE_SEP)
+    if len(parts) != 2:
+        raise TmuxError(f"Unexpected new-session output: {output!r}")
+    return parts[0], parts[1]
+
+
+def create_window(
+    session: str, index: int, window: dict, cwd: str
+) -> tuple[str, str]:
+    args = ["new-window", "-d", "-t", f"{session}:{index}"]
+    name = str(window.get("name") or "")
+    if name:
+        args += ["-n", name]
+    args += [
+        "-c",
+        cwd,
+        "-P",
+        "-F",
+        f"#{{pane_id}}{PANE_SEP}#{{window_id}}",
+    ]
+    output = tmux_out(args)
+    parts = output.split(PANE_SEP)
+    if len(parts) != 2:
+        raise TmuxError(f"Unexpected new-window output: {output!r}")
+    return parts[0], parts[1]
+
+
+def split_window(window_id: str, cwd: str) -> str:
+    return tmux_out(
+        [
+            "split-window",
+            "-d",
+            "-t",
+            window_id,
+            "-c",
+            cwd,
+            "-P",
+            "-F",
+            "#{pane_id}",
+        ]
+    )
+
+
+def create_window_panes(
+    window: dict,
+    window_index: int,
+    window_id: str,
+    first_pane_id: str,
+    first_cwd: str,
+    first_cwd_ok: bool,
+    log: RunLog,
+) -> list[tuple[str, dict, str, bool]]:
+    saved_panes = list(window.get("panes") or [])
+    saved_panes.sort(key=lambda pane: as_int(pane.get("index"), 0))
+    entries: list[tuple[str, dict, str, bool]] = []
+
+    if not saved_panes:
+        cwd = str(Path.home())
+        entries.append((first_pane_id, {"index": 0, "cwd": cwd}, cwd, True))
+        return entries
+
+    for position, pane in enumerate(saved_panes):
+        if position == 0:
+            cwd, cwd_ok = first_cwd, first_cwd_ok
+            pane_id = first_pane_id
+        else:
+            cwd, cwd_ok = pane_cwd(pane, window, log, window_index)
+            pane_id = split_window(window_id, cwd)
+        entries.append((pane_id, pane, cwd, cwd_ok))
+
+    return entries
+
+
+def apply_window_state(
+    window: dict,
+    window_id: str,
+    entries: list[tuple[str, dict, str, bool]],
+    log: RunLog,
+) -> int:
+    errors = 0
+    layout = window.get("layout") or ""
+    if layout:
+        result = tmux(["select-layout", "-t", window_id, layout], check=False)
+        if result.returncode != 0:
+            errors += 1
+            log.error(
+                f"window '{window.get('name')}' layout could not be applied: "
+                f"{result.stderr.strip()}"
+            )
+
+    for pane_id, pane, _cwd, _cwd_ok in entries:
+        title = str(pane.get("title") or "")
+        if title:
+            result = tmux(
+                ["select-pane", "-t", pane_id, "-T", title], check=False
+            )
+            if result.returncode != 0:
+                log.warn(
+                    f"window '{window.get('name')}' pane {pane.get('index')}: "
+                    f"could not set the pane title"
+                )
+
+    active_pane: tuple[str, dict, str, bool] | None = None
+    active_index = window.get("active_pane")
+    for entry in entries:
+        if as_int(entry[1].get("index"), -1) == as_int(active_index, -2):
+            active_pane = entry
+            break
+    if active_pane is None and entries:
+        active_pane = entries[-1]
+
+    if active_pane is not None:
+        pane_id = active_pane[0]
+        result = tmux(["select-pane", "-t", pane_id], check=False)
+        if result.returncode != 0:
+            errors += 1
+            log.error(
+                f"window '{window.get('name')}' active pane could not be selected"
+            )
+
+        if window.get("zoomed"):
+            try:
+                flag = display_pane(pane_id, "#{window_zoomed_flag}")
+            except TmuxError:
+                flag = "0"
+            if flag != "1":
+                result = tmux(["resize-pane", "-Z", "-t", pane_id], check=False)
+                if result.returncode != 0:
+                    errors += 1
+                    log.error(
+                        f"window '{window.get('name')}' could not be zoomed"
+                    )
+    return errors
+
+
+def start_window_commands(
+    window: dict,
+    entries: list[tuple[str, dict, str, bool]],
+    no_commands: bool,
+    log: RunLog,
+) -> int:
+    if no_commands:
+        return 0
+    errors = 0
+    for pane_id, pane, _cwd, cwd_ok in entries:
+        command = str(pane.get("command") or "")
+        if not command.strip() or not cwd_ok:
+            continue
+        wait_for_shell_ready(pane_id, log)
+        wait_for_pane_targets(pane, window, log)
+        try:
+            send_command(pane_id, command)
+        except TmuxError as exc:
+            errors += 1
+            log.error(
+                f"window '{window.get('name')}' pane {pane.get('index')}: "
+                f"could not send the command: {exc}"
+            )
+            continue
+        log.info(
+            f"started window '{window.get('name')}' pane {pane.get('index')}: "
+            f"{command}"
+        )
+    return errors
+
+
+def window_index(window: dict, fallback: int) -> int:
+    try:
+        return int(window.get("index", fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def restore_new_session(
+    session: str, data: dict, no_commands: bool, log: RunLog
+) -> int:
+    windows = list(data.get("windows") or [])
+    if not windows:
+        raise TmuxError("The workspace has no windows")
+    windows.sort(key=lambda window: window_index(window, 0))
+
+    errors = 0
+    created: dict[int, tuple[str, str]] = {}
+
+    try:
+        for position, window in enumerate(windows):
+            widx = window_index(window, position)
+            saved_panes = list(window.get("panes") or [])
+            saved_panes.sort(key=lambda pane: as_int(pane.get("index"), 0))
+            if saved_panes:
+                first_cwd, first_cwd_ok = pane_cwd(
+                    saved_panes[0], window, log, widx
+                )
+            else:
+                first_cwd = str(Path.home())
+                first_cwd_ok = True
+
+            if position == 0:
+                first_pane, window_id = create_first_window(
+                    session, window, first_cwd
+                )
+                try:
+                    current = int(display_pane(window_id, "#{window_index}"))
+                except (TmuxError, ValueError):
+                    current = widx
+                if current != widx:
+                    tmux(
+                        [
+                            "move-window",
+                            "-s",
+                            window_id,
+                            "-t",
+                            f"{session}:{widx}",
+                        ]
+                    )
+            else:
+                first_pane, window_id = create_window(
+                    session, widx, window, first_cwd
+                )
+
+            created[widx] = (window_id, first_pane)
+            entries = create_window_panes(
+                window,
+                widx,
+                window_id,
+                first_pane,
+                first_cwd,
+                first_cwd_ok,
+                log,
+            )
+            errors += apply_window_state(window, window_id, entries, log)
+            errors += start_window_commands(
+                window, entries, no_commands, log
+            )
+    except TmuxError as exc:
+        log.error(f"restore failed: {exc}")
+        if not created:
+            raise
+        return errors + 1
+
+    active_window = data.get("active_window")
+    try:
+        if active_window is not None:
+            active_index = int(active_window)
+            if active_index in created:
+                tmux(
+                    ["select-window", "-t", created[active_index][0]],
+                    check=False,
+                )
+        elif created:
+            tmux(
+                ["select-window", "-t", created[max(created)][0]],
+                check=False,
+            )
+    except (TypeError, ValueError):
+        pass
+
+    return errors
+
+
+def live_window_indexes(session: str) -> set[int]:
+    output = tmux_out(
+        ["list-windows", "-t", session, "-F", "#{window_index}"]
+    )
+    result = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                result.add(int(line))
+            except ValueError:
+                continue
+    return result
+
+
+def restore_missing_windows(
+    session: str,
+    data: dict,
+    no_commands: bool,
+    yes: bool,
+    log: RunLog,
+) -> int:
+    windows = list(data.get("windows") or [])
+    windows.sort(key=lambda window: window_index(window, 0))
+    live = live_window_indexes(session)
+    missing = [
+        window
+        for position, window in enumerate(windows)
+        if window_index(window, position) not in live
+    ]
+    if not missing:
+        log.info(f"No missing windows in '{session}'; nothing to do.")
+        return 0
+
+    print()
+    print(f"Session '{session}' is already running.")
+    print(
+        f"Adding {len(missing)} missing window(s); live windows are not touched."
+    )
+    for window in missing:
+        print(f"  + {window_index(window, 0)}:{window.get('name') or 'window'}")
+    print()
+
+    if not yes and not confirm(f"Add these windows to '{session}'?"):
+        print("Cancelled. The live session was not changed.")
+        return 0
+
+    try:
+        current_window = tmux_out(
+            ["display-message", "-p", "-t", session, "#{window_id}"]
+        )
+    except TmuxError:
+        current_window = ""
+
+    errors = 0
+    for position, window in enumerate(windows):
+        widx = window_index(window, position)
+        if widx in live:
+            continue
+        saved_panes = list(window.get("panes") or [])
+        saved_panes.sort(key=lambda pane: as_int(pane.get("index"), 0))
+        if saved_panes:
+            first_cwd, first_cwd_ok = pane_cwd(
+                saved_panes[0], window, log, widx
+            )
+        else:
+            first_cwd = str(Path.home())
+            first_cwd_ok = True
+        try:
+            first_pane, window_id = create_window(
+                session, widx, window, first_cwd
+            )
+        except TmuxError as exc:
+            errors += 1
+            log.error(
+                f"window '{window.get('name')}' (index {widx}) could not be "
+                f"created: {exc}"
+            )
+            continue
+        entries = create_window_panes(
+            window,
+            widx,
+            window_id,
+            first_pane,
+            first_cwd,
+            first_cwd_ok,
+            log,
+        )
+        errors += apply_window_state(window, window_id, entries, log)
+        errors += start_window_commands(window, entries, no_commands, log)
+
+    if current_window:
+        tmux(["select-window", "-t", current_window], check=False)
+    return errors
 
 
 def choose_restore_session(preferred: str, as_name: str | None) -> str | None:
@@ -382,6 +1313,9 @@ def choose_restore_session(preferred: str, as_name: str | None) -> str | None:
     print()
     print(f"Attach it:           tmux attach -t {session}")
     print(f"Restore a copy:      tmux-manager restore {preferred} --as {preferred}-copy")
+    print()
+    print("Use --if-missing to do nothing when it is already running,")
+    print("or --missing-windows to add back only the missing windows.")
     print()
 
     if as_name:
@@ -403,90 +1337,60 @@ def restore_data(
     path: Path,
     data: dict,
     no_commands: bool,
-    skip_confirm: bool,
-    as_name: str | None = None,
-) -> None:
-    print_preview(path, data)
-    session = choose_restore_session(str(data["workspace"]), as_name)
-    if not session:
-        return
+    yes: bool,
+    as_name: str | None,
+    if_missing: bool,
+    missing_windows: bool,
+    log: RunLog,
+) -> int:
+    session = as_name or str(data.get("workspace") or path.stem)
+    exists = session_exists(session)
 
-    if not skip_confirm and not confirm(f"Restore as new session '{session}'?"):
+    log.info(f"Workspace: {path}")
+    log.info(f"Session: {session}")
+
+    if if_missing and exists:
+        log.info(f"Session '{session}' is already running; nothing to do.")
+        return 0
+
+    if missing_windows and exists:
+        return restore_missing_windows(
+            session, data, no_commands, yes, log
+        )
+
+    print_preview(path, data)
+
+    if exists:
+        chosen = choose_restore_session(str(data["workspace"]), as_name)
+        if not chosen:
+            return 0
+        session = chosen
+        log.info(f"Restoring a copy as: {session}")
+
+    if not yes and not confirm(f"Restore as new session '{session}'?"):
         print("Cancelled.")
-        return
+        return 0
 
     if session_exists(session):
-        die(f"Session '{session}' appeared while confirming. Live session left untouched.")
+        log.error(
+            f"Session '{session}' appeared while confirming. "
+            "Live session left untouched."
+        )
+        return 1
 
-    first_pane = True
-    for window in data["windows"]:
-        name = str(window.get("name") or "window")
-        layout = window.get("layout") or ""
-        window_id = None
+    errors = restore_new_session(session, data, no_commands, log)
+    if errors:
+        log.error(f"Restore finished with {errors} error(s): {session}")
+        return 1
 
-        for pane_number, pane in enumerate(window.get("panes") or []):
-            cwd = existing_cwd(str(pane.get("cwd") or ""))
-            command = "" if no_commands else str(pane.get("command") or "")
-
-            if first_pane:
-                pane_id = tmux_out(
-                    [
-                        "new-session",
-                        "-d",
-                        "-s",
-                        session,
-                        "-n",
-                        name,
-                        "-c",
-                        cwd,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                    ]
-                )
-                first_pane = False
-            elif pane_number == 0:
-                pane_id = tmux_out(
-                    [
-                        "new-window",
-                        "-t",
-                        session,
-                        "-n",
-                        name,
-                        "-c",
-                        cwd,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                    ]
-                )
-            else:
-                if window_id is None:
-                    die("Internal error: missing window id for split")
-                pane_id = tmux_out(
-                    [
-                        "split-window",
-                        "-t",
-                        window_id,
-                        "-c",
-                        cwd,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                    ]
-                )
-
-            window_id = pane_window_id(pane_id)
-            send_command(pane_id, command)
-
-        if layout and window_id:
-            tmux(["select-layout", "-t", window_id, layout], check=False)
-
-    print(f"Restore complete: {session}")
+    log.info(f"Restore complete: {session}")
     print(f"Attach with: tmux attach -t {session}")
+    return 0
 
 
-def pick_from_catalog(entries: list[tuple[Path, dict]]) -> tuple[Path, dict] | None:
+def pick_from_catalog(
+    entries: list[tuple[Path, dict]],
+) -> tuple[Path, dict] | None:
     if not sys.stdin.isatty():
         return None
     choice = input("Number or name (q to quit): ").strip()
@@ -508,29 +1412,562 @@ def pick_from_catalog(entries: list[tuple[Path, dict]]) -> tuple[Path, dict] | N
         return None
 
 
-def cmd_restore(args: argparse.Namespace) -> None:
-    if not args.target:
-        entries = print_catalog()
-        if not entries:
-            return
-        picked = pick_from_catalog(entries)
-        if not picked:
-            return
-        path, data = picked
-        restore_data(path, data, args.no_commands, args.yes, args.as_name)
-        return
+def cmd_restore(args: argparse.Namespace) -> int:
+    log = RunLog(args.log)
+    try:
+        if not args.target:
+            entries = print_catalog()
+            if not entries:
+                return 0
+            picked = pick_from_catalog(entries)
+            if not picked:
+                return 0
+            path, data = picked
+        else:
+            path = resolve_workspace_path(args.target)
+            data = load_workspace(path)
+        return restore_data(
+            path,
+            data,
+            args.no_commands,
+            args.yes,
+            args.as_name,
+            args.if_missing,
+            args.missing_windows,
+            log,
+        )
+    finally:
+        log.close()
 
+
+def window_map(data: dict) -> dict[int, dict]:
+    result = {}
+    for position, window in enumerate(data.get("windows") or []):
+        result[as_int(window.get("index"), position)] = window
+    return result
+
+
+def pane_map(window: dict) -> dict[int, dict]:
+    result = {}
+    for position, pane in enumerate(window.get("panes") or []):
+        result[as_int(pane.get("index"), position)] = pane
+    return result
+
+
+def layout_geometry(layout: object) -> tuple[str, ...]:
+    """Return the size/position parts of a tmux layout string.
+
+    The full layout string contains pane ids and a checksum, which change even
+    when the geometry is identical. Only the geometry is compared.
+    """
+    if not layout:
+        return ()
+    return tuple(re.findall(r"\d+x\d+,\d+,\d+", str(layout)))
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    path = resolve_workspace_path(args.target)
+    saved = load_workspace(path)
+    name = str(saved.get("workspace") or path.stem)
+    session = None
+    for candidate in (name, str(saved.get("source_session") or "")):
+        if candidate and session_exists(candidate):
+            session = candidate
+            break
+    if session is None:
+        die(f"Session '{name}' is not running")
+
+    live = build_workspace(session, name)
+    print()
+    print(f"Diff: saved {path} vs live session '{session}'")
+    print("  - only in the snapshot    + only live    ~ changed")
+    print()
+
+    changes = 0
+    saved_windows = window_map(saved)
+    live_windows = window_map(live)
+    for widx in sorted(set(saved_windows) | set(live_windows)):
+        old_window = saved_windows.get(widx)
+        new_window = live_windows.get(widx)
+        if old_window is None:
+            print(f"  + window {widx}:'{new_window.get('name')}'")
+            changes += 1
+            continue
+        if new_window is None:
+            print(f"  - window {widx}:'{old_window.get('name')}'")
+            changes += 1
+            continue
+        old_name = str(old_window.get("name") or "")
+        new_name = str(new_window.get("name") or "")
+        if old_name != new_name:
+            print(f"  ~ window {widx}: name '{old_name}' -> '{new_name}'")
+            changes += 1
+        if layout_geometry(old_window.get("layout")) != layout_geometry(
+            new_window.get("layout")
+        ):
+            print(f"  ~ window {widx}: layout changed")
+            changes += 1
+        if bool(old_window.get("zoomed")) != bool(new_window.get("zoomed")):
+            print(
+                f"  ~ window {widx}: zoomed {bool(old_window.get('zoomed'))} "
+                f"-> {bool(new_window.get('zoomed'))}"
+            )
+            changes += 1
+        if old_window.get("active_pane") != new_window.get("active_pane"):
+            print(
+                f"  ~ window {widx}: active pane "
+                f"{old_window.get('active_pane')} -> "
+                f"{new_window.get('active_pane')}"
+            )
+            changes += 1
+
+        old_panes = pane_map(old_window)
+        new_panes = pane_map(new_window)
+        for pidx in sorted(set(old_panes) | set(new_panes)):
+            old_pane = old_panes.get(pidx)
+            new_pane = new_panes.get(pidx)
+            label = f"window {widx} pane {pidx}"
+            if old_pane is None:
+                print(
+                    f"  + {label}: {new_pane.get('cwd')}  "
+                    f"{new_pane.get('command') or '-'}"
+                )
+                changes += 1
+                continue
+            if new_pane is None:
+                print(
+                    f"  - {label}: {old_pane.get('cwd')}  "
+                    f"{old_pane.get('command') or '-'}"
+                )
+                changes += 1
+                continue
+            if old_pane.get("cwd") != new_pane.get("cwd"):
+                print(
+                    f"  ~ {label}: folder '{old_pane.get('cwd')}' -> "
+                    f"'{new_pane.get('cwd')}'"
+                )
+                changes += 1
+            old_command = str(old_pane.get("command") or "")
+            new_command = str(new_pane.get("command") or "")
+            if old_command != new_command:
+                print(
+                    f"  ~ {label}: command '{old_command}' -> '{new_command}'"
+                )
+                changes += 1
+
+    saved_active = saved.get("active_window")
+    live_active = live.get("active_window")
+    if saved_active != live_active:
+        print(f"  ~ active window: {saved_active} -> {live_active}")
+        changes += 1
+
+    print()
+    if not changes:
+        print("No differences.")
+        return 0
+    print(f"{changes} difference(s).")
+    return 1
+
+
+SECRET_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:password|passwd|secret|token|api[_-]?key|"
+    r"access[_-]?key|private[_-]?key|secret[_-]?key|auth[_-]?token)"
+    r"\s*[=:]\s*\S+"
+)
+SECRET_FLAG_RE = re.compile(
+    r"(?i)--(?:password|passwd|token|secret|api-key|access-key|private-key)"
+    r"(?:=|\s+)\S+"
+)
+SECRET_VALUE_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_\-]{20,}|ghp_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b"
+)
+
+BARE_PROGRAMS = {
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "nodejs",
+    "celery",
+    "gunicorn",
+    "uvicorn",
+}
+VALUE_FLAGS = {
+    "-b",
+    "--bind",
+    "-w",
+    "--workers",
+    "-k",
+    "--worker-class",
+    "-c",
+    "--config",
+    "--log-level",
+    "--timeout",
+    "-p",
+    "--port",
+    "--host",
+    "--reload-dir",
+    "--app",
+    "-A",
+    "--chdir",
+    "--pid",
+    "--access-logfile",
+    "--error-logfile",
+    "--name",
+    "-n",
+    "--user",
+    "-u",
+    "--group",
+    "-g",
+}
+
+
+def command_program(command: str) -> tuple[str, list[str]] | None:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    while parts and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", parts[0]):
+        parts = parts[1:]
+    if not parts:
+        return None
+    program = os.path.basename(parts[0])
+    if re.fullmatch(r"python\d+(?:\.\d+)?", program):
+        program = "python"
+    if program not in BARE_PROGRAMS:
+        return None
+    return program, parts[1:]
+
+
+def bare_program(command: str) -> str | None:
+    parsed = command_program(command)
+    if parsed is None:
+        return None
+    program, rest = parsed
+    if program in {"python", "node", "nodejs"}:
+        if any(not token.startswith("-") for token in rest):
+            return None
+        target_flags = {"-m", "-c", "-e", "--eval", "-p", "--print"}
+        if any(token in target_flags for token in rest):
+            return None
+        return program
+
+    positionals = []
+    skip_next = False
+    for token in rest:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in VALUE_FLAGS:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        positionals.append(token)
+    if positionals:
+        return None
+    return program
+
+
+def secret_warning(command: str) -> bool:
+    return bool(
+        SECRET_RE.search(command)
+        or SECRET_FLAG_RE.search(command)
+        or SECRET_VALUE_RE.search(command)
+    )
+
+
+def cmd_check(args: argparse.Namespace) -> int:
     path = resolve_workspace_path(args.target)
     data = load_workspace(path)
-    restore_data(path, data, args.no_commands, args.yes, args.as_name)
+    name = str(data.get("workspace") or path.stem)
+    warnings = 0
+
+    print()
+    print(f"Workspace: {name}")
+    print(f"File:      {path}")
+    print()
+
+    for window in sorted(
+        data.get("windows") or [],
+        key=lambda item: as_int(item.get("index"), 0),
+    ):
+        widx = window.get("index", "?")
+        wname = window.get("name") or "window"
+        marks = []
+        if window.get("zoomed"):
+            marks.append("zoomed")
+        suffix = f"  [{', '.join(marks)}]" if marks else ""
+        print(f"  window {widx}:'{wname}'{suffix}")
+        for pane in sorted(
+            window.get("panes") or [],
+            key=lambda item: as_int(item.get("index"), 0),
+        ):
+            pidx = pane.get("index", "?")
+            cwd = str(pane.get("cwd") or "")
+            command = str(pane.get("command") or "")
+            print(
+                f"    pane {pidx}  folder {cwd or '(none)'}  "
+                f"command {command or '(idle)'}"
+            )
+            if cwd and not os.path.isdir(cwd):
+                print("      warning: folder does not exist")
+                warnings += 1
+            if pane.get("guessed"):
+                print("      warning: command was guessed; check it")
+                warnings += 1
+            if command:
+                bare = bare_program(command)
+                if bare:
+                    print(
+                        "      warning: bare interpreter/server without a "
+                        f"script: {bare}"
+                    )
+                    warnings += 1
+                if secret_warning(command):
+                    print(
+                        "      warning: command may contain a password, "
+                        "token, or key"
+                    )
+                    warnings += 1
+        print()
+
+    if warnings:
+        print(f"{warnings} warning(s).")
+        return 1
+    print("No warnings.")
+    return 0
+
+
+def hook_text(shell: str) -> str:
+    body = BASH_HOOK if shell == "bash" else ZSH_HOOK
+    return f"{HOOK_START}\n{body}\n{HOOK_END}\n"
+
+
+def strip_hook(text: str) -> tuple[str, bool]:
+    lines = text.splitlines()
+    result = []
+    inside = False
+    removed = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == HOOK_START:
+            inside = True
+            removed = True
+            continue
+        if inside:
+            if stripped == HOOK_END:
+                inside = False
+            continue
+        result.append(line)
+    if not result:
+        return "", removed
+    return "\n".join(result).rstrip("\n") + "\n", removed
+
+
+def install_hook_file(path: Path, shell: str, remove: bool) -> tuple[bool, bool]:
+    """Return (changed, had_hook)."""
+    try:
+        existing = path.read_text(
+            encoding="utf-8", errors="surrogateescape"
+        )
+    except FileNotFoundError:
+        existing = ""
+    except OSError as exc:
+        die(f"Cannot read {path}: {exc}")
+
+    cleaned, had_hook = strip_hook(existing)
+    if remove:
+        if not had_hook:
+            return False, False
+        path.write_text(
+            cleaned, encoding="utf-8", errors="surrogateescape"
+        )
+        return True, True
+
+    if cleaned and not cleaned.endswith("\n"):
+        cleaned += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        cleaned + hook_text(shell),
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    return True, had_hook
+
+
+def tool_path() -> Path:
+    return Path(__file__).resolve()
+
+
+def warn_if_local_bin_missing() -> None:
+    local_bin = Path.home() / ".local" / "bin"
+    try:
+        local = local_bin.resolve()
+    except OSError:
+        local = local_bin
+    directories = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            directories.append(Path(entry).expanduser().resolve())
+        except OSError:
+            directories.append(Path(entry).expanduser())
+    if local in directories:
+        return
+    print(
+        f"warning: {local_bin} is not in PATH",
+        file=sys.stderr,
+    )
+    print(f"  Use the full path: {tool_path()}", file=sys.stderr)
+    print(
+        '  Or add it with: export PATH="$HOME/.local/bin:$PATH"',
+        file=sys.stderr,
+    )
+
+
+def cmd_install_hook(args: argparse.Namespace) -> int:
+    paths = [
+        (Path.home() / ".bashrc", "bash"),
+        (Path.home() / ".zshrc", "zsh"),
+    ]
+    action = "Removed" if args.remove else "Installed"
+    for path, shell in paths:
+        changed, had_hook = install_hook_file(path, shell, args.remove)
+        if args.remove:
+            if changed:
+                print(f"{action} hook in {path}")
+            else:
+                print(f"No hook found in {path}")
+            continue
+        suffix = " (replaced the old hook)" if had_hook else ""
+        print(f"{action} hook in {path}{suffix}")
+
+    if not args.remove:
+        print()
+        print("Open a new shell inside tmux (or source the file) to start recording.")
+        print("Only commands typed at an interactive prompt inside tmux are recorded.")
+        warn_if_local_bin_missing()
+    return 0
+
+
+def read_crontab() -> str:
+    if shutil.which("crontab") is None:
+        die("crontab is not installed or not in PATH")
+    result = subprocess.run(
+        ["crontab", "-l"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    if result.returncode == 1 and not result.stdout.strip():
+        return ""
+    die(result.stderr.strip() or "Could not read the crontab")
+
+
+def write_crontab(text: str) -> None:
+    if shutil.which("crontab") is None:
+        die("crontab is not installed or not in PATH")
+    result = subprocess.run(
+        ["crontab", "-"],
+        input=text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        die(result.stderr.strip() or "Could not write the crontab")
+
+
+def remove_boot_entries(text: str, name: str | None) -> tuple[str, int]:
+    lines = text.splitlines()
+    result = []
+    removed = 0
+    skip_command = False
+    for line in lines:
+        if line.startswith(BOOT_MARKER):
+            marker_name = line[len(BOOT_MARKER):].strip()
+            if name is None or marker_name == name:
+                removed += 1
+                skip_command = True
+                continue
+        if skip_command and line.startswith("@reboot"):
+            skip_command = False
+            continue
+        skip_command = False
+        result.append(line)
+    return "\n".join(result).strip("\n"), removed
+
+
+def cmd_install_boot(args: argparse.Namespace) -> int:
+    if args.remove:
+        text = read_crontab()
+        cleaned, removed = remove_boot_entries(text, args.name)
+        if not removed:
+            print("No tmux-manager boot entry found.")
+            return 0
+        write_crontab(cleaned + ("\n" if cleaned else ""))
+        label = args.name or "all workspaces"
+        print(f"Removed {removed} boot entry/entries for {label}.")
+        return 0
+
+    if not args.name:
+        die("install-boot needs a workspace name (or use --remove)")
+    if "\n" in args.name or "\r" in args.name:
+        die("The workspace name cannot contain newlines")
+
+    if args.delay < 0:
+        die("--delay cannot be negative")
+
+    log_path = (
+        Path(args.log).expanduser()
+        if args.log
+        else data_home() / "logs" / f"{safe_filename(args.name)}.log"
+    )
+    if not log_path.is_absolute():
+        log_path = Path.cwd() / log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    script = tool_path()
+    delay = f"{args.delay:g}"
+
+    def cron_quote(value: str) -> str:
+        return shlex.quote(value).replace("%", r"\%")
+
+    command = (
+        f"@reboot sleep {delay} && {cron_quote(str(script))} restore "
+        f"{cron_quote(args.name)} --if-missing --yes "
+        f"--log {cron_quote(str(log_path))}"
+    )
+    marker = f"{BOOT_MARKER}{args.name}"
+
+    text = read_crontab()
+    cleaned, _removed = remove_boot_entries(text, args.name)
+    lines = [cleaned] if cleaned else []
+    lines.extend([marker, command])
+    write_crontab("\n".join(lines) + "\n")
+
+    print(f"Installed boot restore for '{args.name}':")
+    print(f"  {command}")
+    print(f"Log file: {log_path}")
+    if not session_exists(args.name):
+        print(f"Session '{args.name}' is not running right now; that is fine.")
+    warn_if_local_bin_missing()
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tmux-manager",
-        description="List, export, and restore tmux workspaces.",
+        description="List, export, check, diff, and restore tmux workspaces.",
         epilog=HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"%(prog)s {VERSION}"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -545,12 +1982,38 @@ def build_parser() -> argparse.ArgumentParser:
         "export",
         help="Save the current (or -t) session into the workspaces folder",
     )
-    export_parser.add_argument("-t", "--session", help="Session to export (default: current)")
-    export_parser.add_argument("-n", "--name", help="Workspace name (default: session name)")
+    export_parser.add_argument(
+        "-t", "--session", help="Session to export (default: current)"
+    )
+    export_parser.add_argument(
+        "-n", "--name", help="Workspace name (default: session name)"
+    )
     export_parser.add_argument(
         "-o",
         "--output",
         help="Custom file path (default: workspaces/<name>.yaml)",
+    )
+    export_parser.add_argument(
+        "--no-commands",
+        action="store_true",
+        help="Save layout and folders only; write command: '' for every pane",
+    )
+    export_parser.add_argument(
+        "--keep",
+        type=int,
+        metavar="N",
+        help="Also keep N dated copies (name.YYYY-MM-DDTHHMM.yaml)",
+    )
+    export_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Do not ask before replacing a smaller/less active snapshot",
+    )
+    export_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace a smaller/less active snapshot without asking",
     )
     export_parser.set_defaults(func=cmd_export)
 
@@ -580,7 +2043,76 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="Create this session name instead (never overwrites a running session)",
     )
+    boot_group = restore_parser.add_mutually_exclusive_group()
+    boot_group.add_argument(
+        "--if-missing",
+        action="store_true",
+        help="Do nothing and exit 0 when the session is already running",
+    )
+    boot_group.add_argument(
+        "--missing-windows",
+        action="store_true",
+        help="Add only the missing windows to a running session",
+    )
+    restore_parser.add_argument(
+        "--log",
+        metavar="FILE",
+        help="Append restore progress and warnings to this file",
+    )
     restore_parser.set_defaults(func=cmd_restore)
+
+    diff_parser = sub.add_parser(
+        "diff",
+        help="Show what changed between a saved snapshot and the live session",
+    )
+    diff_parser.add_argument("target", help="Workspace name or YAML path")
+    diff_parser.set_defaults(func=cmd_diff)
+
+    check_parser = sub.add_parser(
+        "check",
+        help="Inspect a snapshot and warn about risky pane commands",
+    )
+    check_parser.add_argument("target", help="Workspace name or YAML path")
+    check_parser.set_defaults(func=cmd_check)
+
+    hook_parser = sub.add_parser(
+        "install-hook",
+        help="Record exact typed commands in ~/.bashrc and ~/.zshrc",
+    )
+    hook_parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="Remove the hook from both shell rc files",
+    )
+    hook_parser.set_defaults(func=cmd_install_hook)
+
+    boot_parser = sub.add_parser(
+        "install-boot",
+        help="Add an @reboot crontab line that restores a workspace",
+    )
+    boot_parser.add_argument(
+        "name",
+        nargs="?",
+        help="Workspace to restore at boot (omit with --remove to remove all)",
+    )
+    boot_parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="Remove the boot entry (all entries when no name is given)",
+    )
+    boot_parser.add_argument(
+        "--delay",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="Seconds to wait before restoring (default: 15)",
+    )
+    boot_parser.add_argument(
+        "--log",
+        metavar="FILE",
+        help="Restore log file (default: data folder's logs/<name>.log)",
+    )
+    boot_parser.set_defaults(func=cmd_install_boot)
 
     return parser
 
@@ -588,7 +2120,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        code = args.func(args)
+    except TmuxError as exc:
+        die(str(exc), 1)
+    except OSError as exc:
+        die(str(exc), 1)
+    except yaml.YAMLError as exc:
+        die(f"YAML error: {exc}", 1)
+    except KeyboardInterrupt:
+        die("Interrupted.", 130)
+    sys.exit(code or 0)
 
 
 if __name__ == "__main__":
